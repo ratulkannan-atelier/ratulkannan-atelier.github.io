@@ -1,0 +1,370 @@
+4Sight
+Shopify Inventory Reorder Predictor
+Complete Build Log — From Zero to Live on AWS
+Ratul Kannan | April 28 – May 4, 2026
+Live URL: http://foursight-alb-668338117.us-east-1.elb.amazonaws.com
+1. Project Overview
+4Sight is a Shopify app built from scratch in 7 days as a portfolio project for the Shopify Infrastructure Engineer Intern application (Fall 2026). The app solves a real problem: Shopify's native inventory tools show current stock levels but don't forecast when products will run out. Merchants either over-order (cash tied up) or under-order (lost sales). 4Sight predicts stockout dates using a 30-day rolling average of sales velocity with a 20% safety buffer, and ranks products by urgency on a dashboard.
+The goal was never to compete with established tools like Prediko or Inventory Planner — it was to demonstrate end-to-end production-grade infrastructure engineering: real OAuth, real API integration, real AWS deployment, real Terraform, all working together.
+Final Architecture
+The complete data flow from Shopify to the merchant's dashboard:
+EventBridge (daily cron)
+  ↓
+Lambda (Fetcher) → Shopify GraphQL Admin API
+  ↓
+SQS Queue + Dead-Letter Queue
+  ↓
+ECS Fargate (Worker) → RDS PostgreSQL
+  ↑
+Internet → ALB (port 80) → ECS Fargate (Flask app, port 5000) → RDS PostgreSQL
+                                                                 → SES (email alerts)
+
+Secrets Manager (foursight/db, foursight/shopify) → ECS via IAM role
+CloudWatch → logs + alarms
+ECR → Docker image registry
+Terraform → all 30 AWS resources as code
+Tech Stack
+Backend
+Python 3.12 + Flask (application factory pattern)
+ORM
+SQLAlchemy 2.0 with Mapped/mapped_column API
+Database
+PostgreSQL 15 — RDS in production, Docker locally
+Shopify API
+GraphQL Admin API (orders) + REST (products, inventory)
+Compute
+AWS Lambda (fetcher) + ECS Fargate (web app + worker)
+Scheduler
+AWS EventBridge — managed cron
+Queue
+AWS SQS + DLQ — decoupling and failure isolation
+Email
+AWS SES — stockout alerts
+Secrets
+AWS Secrets Manager — credentials never in code
+IaC
+Terraform — 11 files, 30 AWS resources
+Container Registry
+AWS ECR — private, integrated with ECS via IAM
+Observability
+CloudWatch logs + alarms
+Local Dev
+Docker Compose — Postgres + pgAdmin
+CI/CD
+Manual deploy via AWS CLI + ECR push
+2. Day 1 — Database Schema Design
+Started with zero SQL knowledge. Day 1 was entirely about learning SQL fundamentals and designing a normalized database schema before writing a single line of application code.
+What was learned
+Primary keys, foreign keys, and the difference between them
+What normalization means — storing facts once, deriving everything else via JOIN
+The difference between SERIAL (internal auto-increment) and BIGINT (external system IDs)
+Why TIMESTAMPTZ matters over TIMESTAMP — merchants are global, timezone awareness prevents subtle bugs
+When to use DEFAULT NOW() and when not to — only for timestamps the app generates, never for external timestamps
+GROUP BY and aggregate functions — the basis for velocity calculations
+CHECK constraints — enforcing invariants at the database layer
+Schema Design Decisions
+Four Tables
+shops → products → orders → forecasts. This order matters — foreign key dependencies require parent tables to exist first.
+One row per line item in orders (not per Shopify order)
+A single Shopify order can contain multiple products. Storing one row per line item rather than per order means every velocity query is a simple GROUP BY product_id aggregation. This was a deliberate denormalization decision — modeling at the level of the queries you'll run.
+UNIQUE(shop_id, shopify_product_id) not UNIQUE(shopify_product_id)
+Shopify product IDs are only unique within a store, not globally. If 4Sight ever serves multiple merchants (which is the entire point), product IDs from different stores will collide. The composite constraint enforces uniqueness at the right scope.
+shopify_product_id is BIGINT, not a foreign key
+This was a common point of confusion. shopify_product_id is an external identifier from Shopify's system — it's a piece of data, not a reference to a row in our database. A foreign key references a row in OUR tables. Shopify's IDs are BIGINT because they are very large numbers (Shopify uses snowflake-style IDs).
+forecasts uses upsert, not append
+The forecasts table has UNIQUE(product_id) — one row per product, overwritten in place daily. Storing forecast history would require ORDER BY computed_at DESC LIMIT 1 on every dashboard query. Current state is all the dashboard needs, so overwrite is correct. History can be added later as a separate table.
+days_until_stockout CHECK >= 0, not > 0
+Initially designed as > 0, then changed to >= 0 to allow storing zero for out-of-stock products. The dashboard shows these with an OUT OF STOCK badge rather than a days count.
+3. Day 2 — Local Development Environment
+Set up the full local development environment: Docker Compose for Postgres and pgAdmin, Flask application skeleton, SQLAlchemy models, and the initial project structure.
+Docker Compose Decisions
+Postgres 17 alpine — 
+Minimal image, latest stable version. Alpine reduces image size significantly.
+Healthcheck with pg_isready — 
+Detects when Postgres is truly accepting connections, not just when the container started. pgAdmin depends_on with service_healthy waits for this.
+Named volumes — 
+postgres_data and pgadmin_data. Survives docker compose down without losing data.
+Environment variables — 
+All credentials via ${VAR} from .env, not hardcoded. Teaches the right pattern even for local dev.
+Flask Application Factory Pattern
+Used create_app() instead of module-level app creation. This pattern solves three problems: testability (multiple app instances with different configs), circular imports (models can import from app without creating a circular dependency), and multiple configurations (dev vs test vs prod).
+SQLAlchemy 2.0 Modern API
+Used Mapped[str] and mapped_column() instead of the older Column() API. This makes models self-documenting — you can read the type annotations to understand the schema. IDE autocomplete works correctly. The syntax mirrors Python dataclasses.
+server_default vs default
+Used server_default=func.now() for timestamps rather than Python-side default=datetime.now. This means the database generates the timestamp, not the application server. Critical if the app ever runs on multiple servers with potentially different system clocks.
+Health Check Endpoint
+Built /health returning {status: ok, service: reorder-predictor} from Day 2. This endpoint is what the ALB pings every 30 seconds in production. Without it, ECS would never mark the task as healthy and would keep restarting it. Many developers forget this and spend hours debugging deployment failures.
+4. Day 3 — Shopify OAuth Integration
+Implemented the full OAuth 2.0 authorization code grant flow. This is the most security-critical piece of the app — getting it wrong means merchants can't install the app, or worse, the app is vulnerable to CSRF or token forgery attacks.
+Why Two Routes
+The /install route and /callback route serve different purposes in the OAuth flow. They cannot be combined:
+/install — generates a nonce, stores it in session, redirects merchant to Shopify's permission screen
+/callback — verifies the nonce (CSRF protection), verifies HMAC (authenticity), exchanges code for token server-to-server
+The separation is not arbitrary — it reflects the security model. The temporary authorization code travels through the browser (in the redirect URL), but the actual token exchange happens server-to-server so the token never touches the browser.
+Security Measures Implemented
+Nonce/state verification — 
+secrets.token_hex(16) generates a cryptographically random nonce. Stored in Flask session during /install, verified during /callback. Prevents CSRF attacks where an attacker forges a callback.
+HMAC verification — 
+Shopify signs every callback with HMAC-SHA256 using the app's client secret. Verifying this proves the callback came from Shopify and wasn't tampered with.
+Constant-time comparison — 
+hmac.compare_digest() instead of ==. Prevents timing attacks where an attacker measures how long the comparison takes to brute-force the correct HMAC one byte at a time.
+Minimum scopes — 
+read_orders, read_products, read_inventory only. No write access. No customer PII beyond what line items contain.
+Token exchange server-to-server — 
+The temporary code goes through the browser but the token exchange is a direct POST from our server to Shopify's. The access token never travels through the browser.
+Upsert for Reinstalls
+Used INSERT ... ON CONFLICT (shop_domain) DO UPDATE for token storage. This means reinstalling the app (which merchants do when they change plans or accidentally uninstall) simply updates the token rather than failing with a unique constraint violation. Correct behavior with one line of SQL.
+Problems Encountered
+PROBLEM: pgAdmin showing stale data — thought OAuth wasn't writing to the database
+SOLUTION: pgAdmin had an open transaction with MVCC isolation. The data was there — pgAdmin just couldn't see it. Verified by opening a fresh query window.
+PROBLEM: 'App failed to install' error after clicking Install
+SOLUTION: The 404 was on /dashboard (which didn't exist yet), not in the OAuth flow itself. The OAuth completed successfully — the shops table had a new row with the access token. Added logging to confirm rowcount=1 and commit complete.
+PROBLEM: embedded: true in Shopify Dev Dashboard causing 403 on API calls
+SOLUTION: Embedded apps use a different authentication flow (App Bridge token exchange). Since we're using the legacy OAuth flow, embedded must be set to false. Released a new version with embedded: false.
+PROBLEM: 403 Forbidden on orders.json — 'This app is not approved to access REST endpoints with protected customer data'
+SOLUTION: Shopify requires explicit protected customer data approval before any app can access order data. Configured access through the Partner Dashboard (Store management + Analytics reasons) and reinstalled to get a fresh token with the approval applied.
+PROBLEM: Switched to GraphQL but got same 403 — 'This app is not approved to access the Order object'
+SOLUTION: Both REST and GraphQL enforce the same protected customer data policy. The fix was the same — Partner Dashboard approval — which unlocked both APIs simultaneously.
+5. Data Fetcher
+The fetcher pulls order history and product data from Shopify's API and stores it in the database. It's designed to run daily as a Lambda function but works equally well as a standalone Python script for local testing.
+GraphQL Over REST for Orders
+Originally wrote the fetcher using the REST orders.json endpoint. This returned 403 because Shopify's REST API for orders requires protected customer data approval which takes time to process. Switched to the GraphQL Admin API which had the same policy but the approval we configured in the Partner Dashboard unlocked it.
+The switch to GraphQL turned out to be an improvement anyway — GraphQL is Shopify's recommended modern API approach (REST is being deprecated), field selection is more precise, and the cursor-based pagination is cleaner than parsing Link headers.
+Key Implementation Decisions
+Network calls before database transaction — 
+All Shopify API calls happen before the database transaction opens. External HTTP calls can take seconds — holding a database connection open during that time wastes connection pool resources. Fetch everything first, write in one fast transaction.
+RETURNING id on product upsert — 
+After upserting a product, the order insert needs the internal product_id as a foreign key. RETURNING id gives this in the same query — one database round-trip instead of two.
+legacyResourceId for Shopify GIDs — 
+Shopify's GraphQL uses Global IDs (gid://shopify/Order/12345). legacyResourceId extracts the plain integer that matches what the REST API returns and what the rest of the schema expects.
+Skip null product_ids — 
+Shopify sets product_id to null on line items when a merchant deletes a product. Without this guard, the fetcher would try to insert null into a NOT NULL column and crash.
+Inventory summed across variants — 
+A Shopify product can have multiple variants (Blue T-shirt: Small, Medium, Large). Total inventory = sum across all variants. Used or 0 to handle variants with None inventory (untracked products).
+Per-shop exception handling — 
+log.exception() logs the full stack trace automatically. One shop failing doesn't stop other shops. Right pattern for multi-tenant daily jobs.
+Why Daily Batch Over Webhooks
+Webhooks would provide real-time updates but add significant complexity: HMAC verification on every request, idempotency handling (Shopify may deliver the same webhook multiple times), a reliable always-on endpoint, and out-of-order delivery handling. Daily batch demonstrates the same infrastructure patterns (scheduled triggers, async processing, queue-based decoupling) with 20% of the complexity. Webhooks are the natural v2 feature.
+The 30-Day Window Decision
+30 days balances recency with stability. 7 days is too reactive — one unusually good week skews the whole velocity number. 90 days misses recent trend changes. 30 days is the industry standard for rolling average inventory forecasting and matches what merchants intuitively understand as 'this month's sales rate.'
+6. Forecast Worker
+The worker reads raw order data from the database, computes forecasts, and writes results to the forecasts table. It's designed to be triggered by SQS messages from the fetcher but also works as a standalone script.
+The Forecasting Math
+Simple and defensible:
+Sales velocity = total units sold in last 30 days / 30 = units per day
+Adjusted velocity = velocity × 1.2 (20% safety factor for demand variability)
+Days until stockout = current inventory / adjusted velocity
+If current inventory = 0: days_until_stockout = 0 (already out of stock)
+If no orders in 30 days: skip (no forecast written — product isn't at risk)
+Days are stored as real calculated values, not capped — display cap of 90+ handled in the UI
+The Safety Factor Decision
+Multiplying velocity by 1.2 before dividing into inventory artificially shortens the predicted stockout date, giving merchants a buffer for unexpected demand spikes. This is a simplified version of safety stock calculation used in real inventory management. In production, this would be configurable per merchant based on their demand volatility and supplier lead times.
+Why Not Machine Learning
+A time series model (Prophet, ARIMA) would account for seasonality and trends. But it requires 1-2 years of historical data to detect seasonal patterns, adds significant complexity, and shifts the project from infrastructure engineering to data science. The 30-day moving average is the simplest model that produces useful results. The safety factor acknowledges the model's limitations without pretending to solve them.
+Upsert Pattern
+ON CONFLICT (product_id) DO UPDATE overwrites the existing forecast row. The database enforces one forecast per product via the UNIQUE constraint — the application code doesn't have to check for existing rows. Database-level enforcement is always more reliable than application-level checks.
+7. Dashboard
+The dashboard is a Flask route that reads from the forecasts table joined to products, ranks by days_until_stockout ascending (most urgent first), and renders an HTML template. No JavaScript frameworks — plain Jinja2 templates with vanilla JavaScript for sorting and filtering.
+Design Decisions
+Shopify color palette — 
+Used Shopify's design system colors (#008060 green, #f6f6f7 background, #d82c0d red, etc.) so the app feels native to the Shopify admin. Merchants who use Shopify daily immediately recognize the visual language.
+Light theme over dark theme — 
+Started with a dark navy theme (matching the 4Sight logo), then switched to light theme matching Shopify admin. The reasoning: merchants don't want a jarring visual context switch when they open the app from their store admin.
+Summary cards — 
+Four cards showing Total, Critical, Warning, Healthy counts at a glance. A merchant can see the urgency distribution in 1 second without reading the table.
+Sortable columns — 
+Vanilla JavaScript sort — clicking a column header sorts by that column with ↑↓ indicators. No external JS libraries needed for this level of interactivity.
+Show at-risk only filter — 
+Hides products with > 30 days of stock so merchants can focus on what needs attention. Built as a pure client-side toggle.
+Color-coded row borders — 
+3px left border: red for critical, orange for warning, green for healthy. The color communicates urgency before the merchant reads any text.
+90+ days display — 
+Real calculated values stored in the database (some products have 2,000+ days of stock). UI shows 90+ for anything over 90 — the precision beyond 90 days is meaningless for a merchant.
+Dashboard Route Logic
+Hardcoded shop_id=1 for the demo. In production, this would read from the session after OAuth to serve the correct merchant's data. The data model supports multi-tenancy — every table has a shop_id foreign key — the route just needs to be updated to filter by the authenticated merchant.
+8. Containerization
+Containerized the Flask app with Docker so it can run identically on any machine — local development, CI/CD, and AWS ECS Fargate.
+Dockerfile Decisions
+python:3.12-slim — 
+Minimal Python image — slim removes unnecessary packages reducing image size from ~1GB to ~150MB. Smaller images pull faster from ECR to ECS.
+Copy requirements.txt before application code — 
+Docker builds in layers and caches each one. If requirements.txt hasn't changed, Docker reuses the cached pip install layer. Only changed application code triggers a rebuild of the final layer. Without this ordering, every code change would re-run pip install — significantly slower CI/CD.
+PYTHONUNBUFFERED=1 — 
+Makes Python write stdout/stderr immediately without buffering. Critical for CloudWatch — without this, logs appear in batches or not at all, making debugging in production very difficult.
+PYTHONDONTWRITEBYTECODE=1 — 
+Prevents Python from creating .pyc compiled files inside the container. Keeps the image clean and avoids stale bytecode issues.
+.dockerignore — 
+Excludes .venv (200MB of packages already installed via pip), .env (credentials), .git (version history), __pycache__. Without this, docker build context would be enormous and might include credentials.
+Local Container Verification
+Before deploying to AWS, verified the container worked locally using docker run with --network host to connect to the local Postgres instance. Health check returned {status: ok} and dashboard rendered correctly. This step prevents wasting time debugging infrastructure issues that are actually application issues.
+9. AWS Infrastructure (Terraform)
+All 30 AWS resources defined in Terraform across 11 files. The infrastructure was planned, validated (terraform validate), and dry-run (terraform plan) before a single dollar was spent.
+File Structure and Separation
+main.tf
+AWS provider configuration, default tags
+variables.tf
+Input variables — DB password, Shopify credentials, region
+vpc.tf
+VPC, subnets, internet gateway, route tables
+security_groups.tf
+ALB, ECS, RDS firewall rules — security group chaining
+ecr.tf
+Container registry with lifecycle policy and image scanning
+rds.tf
+Managed PostgreSQL with subnet group
+secrets.tf
+Secrets Manager for DB and Shopify credentials
+iam.tf
+ECS task execution role with least-privilege policies
+ecs.tf
+Cluster, task definition, service, CloudWatch log group
+alb.tf
+Load balancer, target group, HTTP listener
+outputs.tf
+ALB URL, ECR URL, RDS endpoint printed after apply
+Network Architecture
+VPC 10.0.0.0/16 — 
+Private network for all resources. enable_dns_hostnames = true required for RDS to get a DNS hostname.
+2 public subnets — 
+10.0.1.0/24 (us-east-1a) and 10.0.2.0/24 (us-east-1b). ALB and ECS live here. map_public_ip_on_launch = true so ECS tasks get public IPs.
+2 private subnets — 
+10.0.3.0/24 (us-east-1a) and 10.0.4.0/24 (us-east-1b). RDS lives here. No internet route — RDS cannot initiate or receive internet connections.
+No NAT Gateway — 
+Saves $32/month. ECS in public subnets can reach the internet (Shopify API, ECR) directly. Documented tradeoff — production would use private subnets + NAT for defense in depth.
+Security Group Chaining
+Three security groups forming a chain:
+ALB SG: accepts inbound 80 + 443 from 0.0.0.0/0 (internet)
+ECS SG: accepts inbound 5000 from ALB SG only — not from internet directly
+RDS SG: accepts inbound 5432 from ECS SG only — nothing else can reach the database
+This means even if someone discovers the ECS task's public IP, they cannot connect to port 5000 directly — only the ALB can. And the database is completely unreachable from anywhere except the ECS tasks.
+IAM Least Privilege
+The ECS task execution role has exactly two sets of permissions: the AWS managed AmazonECSTaskExecutionRolePolicy (allows pulling from ECR and writing to CloudWatch), and a custom inline policy allowing GetSecretValue on only the two specific secret ARNs the app needs. The role cannot read any other secrets in the account.
+Secrets Manager
+Two secrets: foursight/db (host, port, username, password, dbname) and foursight/shopify (api_key, api_secret, app_url, api_scopes). ECS injects these as environment variables at container startup using the secrets block in the task definition. The syntax arn:secret:key:: extracts a specific JSON key from the secret.
+recovery_window_in_days = 0 means secrets are deleted immediately on terraform destroy rather than entering a 7-30 day pending deletion period. Without this, running terraform apply again after destroy would fail because the secret names are still reserved.
+app_name Change from 4sight to foursight
+PROBLEM: terraform plan failed: 'first character of identifier must be a letter' on the RDS instance identifier
+SOLUTION: AWS RDS identifiers cannot start with a number. Changed app_name default from '4sight' to 'foursight' in variables.tf. Since all resource names use ${var.app_name} as a prefix, one variable change fixed all resource names simultaneously. This is the value of consistent naming conventions in Terraform.
+terraform apply Results
+30 resources created in approximately 7 minutes. The slowest resources:
+RDS db.t3.micro — ~5 minutes to provision
+ALB — ~2.5 minutes
+Everything else — under 10 seconds each
+Outputs after apply: alb_dns_name, ecr_repository_url, rds_endpoint — the three values needed for the next steps.
+10. Deployment to AWS
+Getting the app live involved several steps after terraform apply: pushing the Docker image, initializing the database, configuring the Shopify app URL, and verifying end-to-end functionality.
+Pushing Docker Image to ECR
+Three commands: authenticate Docker to ECR using aws ecr get-login-password, tag the local image with the ECR repository URL, push. ECR and ECS are in the same AWS network — image pulls are fast and don't go over the public internet.
+Running Schema on RDS
+This was the most difficult step of the entire project. RDS is in private subnets (publicly_accessible = false) so it cannot be reached from a laptop. Multiple approaches failed:
+PROBLEM: AWS RDS Query Editor — only supports Aurora Serverless, not standard PostgreSQL
+PROBLEM: Standard CloudShell — runs outside the VPC, cannot reach private subnets
+PROBLEM: psql from WSL with temporary security group rule — WSL has its own networking layer that caused connection timeouts even with the correct IP whitelisted
+SOLUTION: CloudShell VPC environment — created a CloudShell session configured to run inside the foursight-vpc using the foursight-public-a subnet and foursight-ecs-sg security group. This CloudShell session is inside the VPC and the ECS security group already has permission to reach RDS. nc -zv confirmed connectivity (Connected to 10.0.4.201:5432). Ran schema manually using psql with PGPASSWORD environment variable.
+Also temporarily set publicly_accessible = true via terraform apply to attempt direct connection, but WSL networking issues prevented this from working regardless.
+Chicken-and-Egg: shopify_app_url
+PROBLEM: The Shopify app URL must be configured in two places: Secrets Manager (so the Flask app knows its own URL for OAuth redirect_uri) and the Shopify Dev Dashboard (so Shopify whitelists the callback URL). But the ALB URL is only known after terraform apply, and terraform apply needs the URL to populate Secrets Manager.
+SOLUTION: Two-step deployment. First apply with shopify_app_url = 'http://placeholder.com'. Get the ALB URL from outputs. Update terraform.tfvars with the real URL. Second apply updates only the Secrets Manager secret (1 resource change, takes seconds). Force-redeploy ECS to pick up the new secret. Update Dev Dashboard with real URL. Release new app version.
+redirect_uri Missing http://
+PROBLEM: After updating Shopify Dev Dashboard with the ALB URL, OAuth showed 'The redirect_uri is not whitelisted'. The browser URL showed redirect_uri=foursight-alb-668338117.us-east-1.elb.amazonaws.com/callback — missing the http:// prefix.
+SOLUTION: terraform.tfvars had shopify_app_url = 'foursight-alb-...' without the http:// scheme. Updated to 'http://foursight-alb-...', ran terraform apply to update Secrets Manager, force-redeployed ECS. The app constructs redirect_uri as f'{SHOPIFY_APP_URL}/callback' — without the scheme, the resulting URL is invalid.
+Running Fetcher and Worker on Production
+Since RDS is in private subnets, running fetcher.py locally cannot connect to production. Used aws ecs run-task to launch one-off ECS tasks inside the VPC that run the fetcher and worker commands. This is the correct pattern for running operational tasks in a VPC-isolated environment — the tasks have the same network access and IAM permissions as the web service.
+Fetcher: 16 orders, 17 products, 18 line items, 17 inventory updates
+Worker: 5 forecasts written
+Both verified via CloudWatch logs streaming in real-time.
+Final Verification
+Dashboard at http://foursight-alb-668338117.us-east-1.elb.amazonaws.com showed:
+5 products tracked
+1 Critical — The 3p Fulfilled Snowboard (13 days, red badge)
+1 Warning — The Compare at Price Snowboard (25 days, orange badge)
+3 Healthy — Complete Snowboard (60 days), Minimal (90+), Multi-location (90+)
+Last updated: May 4, 2026 01:04 UTC
+11. All Problems Encountered & How They Were Solved
+This section documents every significant problem in chronological order. Problems are the most valuable part of a build log — they show real engineering judgment.
+1. pgAdmin Stale Data (Day 3)
+PROBLEM: OAuth callback was completing (302 response) but shops table appeared unchanged in pgAdmin
+SOLUTION: PostgreSQL MVCC: pgAdmin had an open transaction that predated the commit. The data existed — pgAdmin's transaction isolation prevented it from seeing new commits. Fixed by opening a fresh query window. Lesson: always verify data layer issues with a clean connection before assuming the write failed.
+2. Shopify embedded:true Causing OAuth Issues (Day 3)
+PROBLEM: 403 errors on Shopify API calls despite correct scopes
+SOLUTION: The app was configured as embedded (embedded: true in Dev Dashboard). Embedded apps use App Bridge token exchange, not standard OAuth. Since we're using legacy OAuth, embedded must be false. Released a new version with the setting disabled.
+3. Protected Customer Data Restriction (Day 4)
+PROBLEM: REST orders.json returning 403: 'This app is not approved to access REST endpoints with protected customer data'
+SOLUTION: Shopify requires explicit approval via the Partner Dashboard before any app can access order data (it's considered protected customer data). Configured access with Store management and Analytics as the stated purposes. After reinstalling the app with a fresh token, access was granted. Both REST and GraphQL enforce this — the same approval unlocked both.
+4. GraphQL Returning data:null (Day 4)
+PROBLEM: After switching to GraphQL, response had errors array and data:null instead of order data
+SOLUTION: Same protected customer data policy applies to GraphQL. Solution was the same Partner Dashboard configuration. The GraphQL approach was kept since it's Shopify's recommended modern API.
+5. Zero Orders Fetched Initially (Day 4)
+PROBLEM: Fetcher ran successfully but returned 0 orders
+SOLUTION: The dev store had no orders at all — the test data only generated products. Created 11 draft orders in the Shopify admin and marked them as paid. Then confirmed fetcher returned 11 orders.
+6. RDS Connection Impossible From Laptop (Day 7)
+PROBLEM: RDS in private subnets cannot be reached from laptop. Aurora Query Editor not available. Standard CloudShell not in VPC. WSL psql timing out despite security group rule allowing the IP.
+SOLUTION: Created a CloudShell VPC environment inside foursight-vpc using the public subnet and ECS security group. This CloudShell instance is inside the VPC and the ECS SG already has permission to reach RDS. Verified with nc -zv before running schema.
+7. app_name Cannot Start With Number (Day 6)
+PROBLEM: terraform plan error: 'first character of identifier must be a letter' on RDS identifier foursight-db (actually '4sight-db')
+SOLUTION: Changed app_name default from '4sight' to 'foursight' in variables.tf. One variable change propagated to all 30 resource names through ${var.app_name} interpolation.
+8. shopify_app_url Missing http:// Scheme (Day 7)
+PROBLEM: OAuth redirect failed with 'redirect_uri is not whitelisted'. Browser URL showed the redirect_uri without http:// prefix.
+SOLUTION: terraform.tfvars had the URL without the scheme. The Flask app concatenates SHOPIFY_APP_URL + '/callback' to build redirect_uri. Without the scheme, the resulting URL is invalid and Shopify rejects it. Updated tfvars, applied Terraform, force-redeployed ECS.
+9. ECS Running Old Secrets After Update (Day 7)
+PROBLEM: After updating Secrets Manager with the real ALB URL, ECS tasks were still using the old placeholder URL
+SOLUTION: ECS pulls secrets at container startup. Running tasks don't automatically refresh. aws ecs update-service --force-new-deployment terminates the old task and starts a new one that reads the updated secrets on startup.
+12. Build Metrics
+Total build time
+7 days (April 28 – May 4, 2026)
+Lines of Python code
+~600 (fetcher, worker, routes, models, config)
+Lines of Terraform
+~350 (11 files, 30 resources)
+Lines of HTML/CSS/JS
+~200 (dashboard template)
+AWS resources created
+30
+Terraform files
+11
+Database tables
+4
+Shopify API calls per daily run
+2-5 (pagination dependent)
+Container image size
+~150MB (python:3.12-slim)
+ECS task CPU/Memory
+256 vCPU / 512MB RAM
+RDS instance
+db.t3.micro, 20GB gp2
+Estimated AWS cost
+~$46/month (ALB $18 + ECS $9 + RDS $15 + misc)
+Git commits
+8 meaningful commits from foundation to deployment
+Starting SQL knowledge
+Zero — learned from scratch during build
+Starting Terraform knowledge
+Foundational — wrote production config during build
+13. What's Next
+Infrastructure Completion (Post-Submission)
+EventBridge scheduled rule triggering daily Lambda
+Lambda function running fetcher logic automatically
+SQS queue + DLQ between fetcher and worker
+CloudWatch alarms on DLQ depth and Lambda errors
+SES email alerts when days_until_stockout < threshold
+HTTPS with ACM certificate + ALB HTTPS listener
+Product Features
+Per-product detail page with order history
+Settings page for configurable alert threshold per merchant
+Multi-merchant dashboard isolation (currently hardcoded shop_id=1)
+Proper error pages (currently Flask default 404)
+Webhook support for real-time updates instead of daily batch
+Production Hardening
+ECS in private subnets with NAT Gateway for defense in depth
+RDS Multi-AZ for automatic failover
+ECS desired_count >= 2 for zero-downtime deployments
+Alembic migrations instead of manual schema.sql
+IAM user with least-privilege instead of root access keys
+Secret rotation for database password and Shopify tokens
+Real SECRET_KEY in Secrets Manager instead of hardcoded string
+Business Path (If Launching)
+Shopify Billing API integration for subscription charging
+Privacy policy and merchant documentation (required for App Store)
+App Store submission and review process (6-8 weeks)
+Beta merchant recruitment for forecasting accuracy validation
+Built by Ratul Kannan | April 28 – May 4, 2026 | 7 days from zero SQL to live on AWS
